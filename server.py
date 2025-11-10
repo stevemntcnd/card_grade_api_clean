@@ -1,82 +1,133 @@
-# ==========================================================
-# server.py — FastAPI wrapper for card grading pipeline
-# ==========================================================
-
-from fastapi import FastAPI, HTTPException
+import io
+import os
+import cv2
+import base64
+import numpy as np
+import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from new_card_grade import preprocess_card_image, grade_card
-import json
-import datetime
+from datetime import datetime
+from openai import OpenAI
 
-app = FastAPI(
-    title="MintCondition Card Grader API",
-    description="Runs pre-processing and grading using your OpenCV + OpenAI pipeline.",
-    version="1.1"
+# ==========================================================
+# APP CONFIG
+# ==========================================================
+app = FastAPI(title="MintCondition Card Grader API", version="1.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # for demo: allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 # ==========================================================
-# Request Schema
+# REQUEST MODEL
 # ==========================================================
 class CardRequest(BaseModel):
-    front_url: str
-    back_url: str
+    front_url: str | None = None
+    back_url: str | None = None
+    front_b64: str | None = None
+    back_b64: str | None = None
     quality: int = 90
     maxdim: int = 1500
 
+
 # ==========================================================
-# Health Check
+# IMAGE LOADING HELPER
 # ==========================================================
-@app.get("/")
-def root():
+def load_image(source_url: str | None = None, b64data: str | None = None):
+    """Load image from URL or base64 string."""
+    if source_url:
+        try:
+            resp = requests.get(source_url, timeout=10)
+            resp.raise_for_status()
+            img_arr = np.frombuffer(resp.content, np.uint8)
+            return cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+        except Exception as e:
+            raise RuntimeError(f"Could not load image from URL: {e}")
+
+    elif b64data:
+        try:
+            if "," in b64data:
+                b64data = b64data.split(",")[1]  # remove data URL prefix
+            img_bytes = base64.b64decode(b64data)
+            img_arr = np.frombuffer(img_bytes, np.uint8)
+            return cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+        except Exception as e:
+            raise RuntimeError(f"Could not decode base64 image: {e}")
+
+    else:
+        raise ValueError("No valid image source provided.")
+
+
+# ==========================================================
+# PREPROCESSING PLACEHOLDER
+# ==========================================================
+def preprocess_card_image(img):
+    """Placeholder preprocessing logic."""
+    if img is None:
+        return {"status": "error", "message": "No image provided."}
+
+    height, width = img.shape[:2]
+    mean_intensity = float(np.mean(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)))
+
     return {
-        "status": "ok",
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "message": "MintCondition Card Grader API is live."
+        "dimensions": {"width": width, "height": height},
+        "mean_intensity": mean_intensity,
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
+
 # ==========================================================
-# Main Endpoint
+# ROUTES
 # ==========================================================
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "MintCondition Card Grader API is live."}
+
+
 @app.post("/grade_card")
 def grade_card_endpoint(req: CardRequest):
-    """
-    Runs preprocessing on front/back images and submits them to OpenAI for grading.
-    Returns both preprocessing JSON and grading results.
-    """
     try:
-        print("==========================================================")
-        print(f"[INFO] Starting card grading at {datetime.datetime.now()}")
-        print(f"[INFO] Front URL: {req.front_url}")
-        print(f"[INFO] Back  URL: {req.back_url}")
-        print("==========================================================")
+        # Load images (front & back)
+        front_img = load_image(req.front_url, req.front_b64)
+        back_img = load_image(req.back_url, req.back_b64)
 
-        # --- Step 1: Preprocess images ---
-        pre_json_front, front_b64 = preprocess_card_image(req.front_url, req.quality, req.maxdim)
-        pre_json_back, back_b64 = preprocess_card_image(req.back_url, req.quality, req.maxdim)
+        # Run preprocessing
+        front_data = preprocess_card_image(front_img)
+        back_data = preprocess_card_image(back_img)
 
-        combined_pre = {
-            "front_measurements": pre_json_front,
-            "back_measurements": pre_json_back
-        }
+        # Combine and send to OpenAI (this can be replaced by your grading prompt)
+        combined_prompt = f"""
+        Given the following card preprocessing data:
+        FRONT: {front_data}
+        BACK: {back_data}
+        Estimate condition and PSA-style grading summary.
+        """
 
-        print("[INFO] Preprocessing complete. Sending to OpenAI grading prompt...")
-
-        # --- Step 2: Call OpenAI model ---
-        result = grade_card(front_b64, back_b64, combined_pre)
-
-        # --- Step 3: Log raw model output ---
-        print("----------------------------------------------------------")
-        print("[MODEL RESPONSE]")
-        print(result)
-        print("----------------------------------------------------------")
+        completion = client.responses.create(
+            model="gpt-5-mini",
+            input=[{"role": "user", "content": combined_prompt}],
+        )
 
         return {
             "success": True,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-            "preprocessing": combined_pre,
-            "grading_result": result
+            "timestamp": datetime.utcnow().isoformat(),
+            "preprocessing": {
+                "front": front_data,
+                "back": back_data,
+            },
+            "grading_result": completion.output_text,
         }
 
     except Exception as e:
-        print(f"[ERROR] {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
