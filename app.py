@@ -1,8 +1,11 @@
 """
-Mint Condition Card Grader API (v1.8)
+Mint Condition Card Grader API (v2.1)
 -------------------------------------
-Refined for extreme off-center detection (90/10+).
-Integrates updated Prompt Version 10.
+• Includes enhanced preprocessing for accurate extreme off-centering (90/10+)
+• CLAHE lighting normalization
+• Shadow suppression and convex-hull contour recovery
+• Aspect-ratio sanity check
+• Full grading endpoint with Prompt v10 integration
 """
 
 from fastapi import FastAPI, UploadFile, File
@@ -18,7 +21,7 @@ PROMPT_ID = "pmpt_690fe027d50c819782c0d8720142b0b00e6d4016c646f820"
 PROMPT_VERSION = "10"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Mint Condition Grader API (v1.8 Extreme Centering Fix)")
+app = FastAPI(title="Mint Condition Grader API v2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,116 +32,132 @@ app.add_middleware(
 )
 
 # ==========================================================
-# EDGE UTILITIES
+# IMAGE UTILITIES
 # ==========================================================
-def refine_edges(img_gray):
-    """Detect faint outer card border, even against similar backgrounds."""
-    grad_x = cv2.Sobel(img_gray, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(img_gray, cv2.CV_32F, 0, 1, ksize=3)
+def apply_clahe(gray):
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    return clahe.apply(gray)
+
+def remove_shadows(gray):
+    dilated = cv2.dilate(gray, np.ones((15,15), np.uint8))
+    bg = cv2.medianBlur(dilated, 35)
+    diff = 255 - cv2.absdiff(gray, bg)
+    norm = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+    return norm
+
+def refine_edges(gray):
+    """Detect faint outer card border even with uneven lighting."""
+    gray = apply_clahe(gray)
+    gray = remove_shadows(gray)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(grad_x, grad_y)
     norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # Lower threshold + heavier dilation to include faint dark borders
-    _, edges = cv2.threshold(norm, 15, 255, cv2.THRESH_BINARY)
-    edges = cv2.dilate(edges, np.ones((7,7), np.uint8), iterations=2)
+    _, edges = cv2.threshold(norm, 12, 255, cv2.THRESH_BINARY)
+    edges = cv2.dilate(edges, np.ones((9,9), np.uint8), iterations=2)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
     return edges
 
+def get_main_contour(edges, image_shape):
+    """Find primary rectangular contour and repair gaps via convex hull."""
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No contours found.")
+    h, w = image_shape[:2]
+    c = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(c)
+    (cx, cy), (rw, rh), _ = rect
+    aspect = rw / rh if rh else 1
+    if aspect < 0.6 or aspect > 1.6 or cv2.contourArea(c) < 0.2 * h * w:
+        for alt in sorted(contours, key=cv2.contourArea, reverse=True)[1:]:
+            r = cv2.minAreaRect(alt)
+            (cx, cy), (rw, rh), _ = r
+            a = rw / rh if rh else 1
+            if 0.6 < a < 1.6:
+                c = alt
+                break
+    return cv2.convexHull(c)
 
 def measure_borders(edge_img, axis="horizontal"):
-    """Measure left/right or top/bottom border pixel thickness."""
+    """Return pixel thickness of borders on given axis."""
     h, w = edge_img.shape
     if axis == "horizontal":
-        left = next((x for x in range(w // 2) if np.count_nonzero(edge_img[:, x]) > 5), w)
-        right = next((x for x in range(w - 1, w // 2, -1) if np.count_nonzero(edge_img[:, x]) > 5), w)
-        return max(left, 2), max(w - right, 2)
+        left = next((x for x in range(w) if np.count_nonzero(edge_img[:, x]) > 5), w)
+        right = next((x for x in range(w - 1, -1, -1) if np.count_nonzero(edge_img[:, x]) > 5), w)
+        return max(left, 1), max(w - right, 1)
     else:
-        top = next((y for y in range(h // 2) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
-        bottom = next((y for y in range(h - 1, h // 2, -1) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
-        return max(top, 2), max(h - bottom, 2)
-
+        top = next((y for y in range(h) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
+        bottom = next((y for y in range(h - 1, -1, -1) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
+        return max(top, 1), max(h - bottom, 1)
 
 # ==========================================================
 # PREPROCESSING
 # ==========================================================
 def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
-    """Extract border geometry and compute PSA-style centering ratios."""
-    contents = np.frombuffer(file.file.read(), np.uint8)
-    img = cv2.imdecode(contents, cv2.IMREAD_COLOR)
+    """Extract border geometry and compute centering ratios."""
+    buf = np.frombuffer(file.file.read(), np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError(f"Could not load {file.filename}")
+        raise ValueError(f"Cannot load {file.filename}")
 
     h, w = img.shape[:2]
     scale = max(h, w) / max_dim
     if scale > 1.0:
         img = cv2.resize(img, (int(w / scale), int(h / scale)), interpolation=cv2.INTER_AREA)
-        h, w = img.shape[:2]
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = refine_edges(gray)
+    contour = get_main_contour(edges, img.shape)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ValueError("No contours found.")
-
-    c = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(c)
+    rect = cv2.minAreaRect(contour)
     box = cv2.boxPoints(rect)
     box = np.int0(box)
-    x_coords = [p[0] for p in box]
-    y_coords = [p[1] for p in box]
-    x_min, x_max = min(x_coords), max(x_coords)
-    y_min, y_max = min(y_coords), max(y_coords)
-    w_box, h_box = x_max - x_min, y_max - y_min
-    x, y = x_min, y_min
+    x_min, y_min = np.min(box[:,0]), np.min(box[:,1])
+    x_max, y_max = np.max(box[:,0]), np.max(box[:,1])
+    cropped = img[y_min:y_max, x_min:x_max]
+    edges_cropped = edges[y_min:y_max, x_min:x_max]
 
-    cropped = img[y:y+h_box, x:x+w_box]
-    edges_cropped = edges[y:y+h_box, x:x+w_box]
+    left, right = measure_borders(edges_cropped, "horizontal")
+    top, bottom = measure_borders(edges_cropped, "vertical")
 
-    left_px, right_px = measure_borders(edges_cropped, "horizontal")
-    top_px, bottom_px = measure_borders(edges_cropped, "vertical")
-
-    horiz_ratio = round(min(left_px, right_px) / max(left_px, right_px + 1e-5), 3)
-    vert_ratio = round(min(top_px, bottom_px) / max(top_px, bottom_px + 1e-5), 3)
-
-    # Identify extreme off-center (≈ 85/15 or worse)
-    extreme_offcenter = horiz_ratio < 0.15 or vert_ratio < 0.15
-    ceiling = 2.0 if extreme_offcenter else None
+    horiz_ratio = round(min(left, right) / max(left, right + 1e-5), 3)
+    vert_ratio = round(min(top, bottom) / max(top, bottom + 1e-5), 3)
+    extreme = horiz_ratio < 0.15 or vert_ratio < 0.15
+    ceiling = 2.0 if extreme else None
 
     pre_json = {
         "filename": file.filename,
         "dimensions": {"width": w, "height": h},
-        "borders": {"top": top_px, "bottom": bottom_px, "left": left_px, "right": right_px},
+        "borders": {"top": top, "bottom": bottom, "left": left, "right": right},
         "ratios": {"horizontal": horiz_ratio, "vertical": vert_ratio},
-        "extreme_offcenter": extreme_offcenter,
+        "extreme_offcenter": extreme,
         "ceiling": ceiling,
     }
 
-    _, buffer = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    b64_img = base64.b64encode(buffer).decode("utf-8")
-    return pre_json, b64_img
-
+    _, enc = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    b64 = base64.b64encode(enc).decode("utf-8")
+    return pre_json, b64
 
 # ==========================================================
-# GRADE ENDPOINT
+# ENDPOINTS
 # ==========================================================
 @app.post("/grade-card")
 async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)):
-    """Main grading endpoint — preprocess + call OpenAI vision model."""
+    """Preprocess both sides and send for grading."""
     front_pre, front_b64 = preprocess_card_image(front)
     back_pre, back_b64 = preprocess_card_image(back)
-    combined_pre = {"front_measurements": front_pre, "back_measurements": back_pre}
+    combined = {"front_measurements": front_pre, "back_measurements": back_pre}
 
-    instruction_text = (
+    instruction = (
         "You are a PSA-style card grading assistant.\n"
         "Use the provided preprocessing ratios for centering; do not re-measure visually.\n"
-        "Treat ratios below 0.15 as extreme off-center (≈90/10).\n"
+        "Treat ratios below 0.15 as extreme off-center (~90/10).\n"
         "Ratios near 1.0 are balanced. Use them to determine centering score and ceiling.\n"
-        "Then evaluate corners, edges, and surface visually from attached images.\n"
-        "Output structured JSON matching schema v7.0."
+        "Then evaluate corners, edges, and surface visually from the attached images.\n"
+        "Output structured JSON matching schema v10.0."
     )
 
-    print(f"[INFO] Sending {front.filename} / {back.filename} with Prompt v10 and structured preprocessing.")
+    print(f"[INFO] Grading {front.filename} / {back.filename} using Prompt v10")
 
     response = client.responses.create(
         prompt={"id": PROMPT_ID, "version": PROMPT_VERSION},
@@ -146,8 +165,8 @@ async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": instruction_text},
-                    {"type": "input_text", "text": json.dumps(combined_pre, indent=2)},
+                    {"type": "input_text", "text": instruction},
+                    {"type": "input_text", "text": json.dumps(combined, indent=2)},
                     {"type": "input_image", "image_url": f"data:image/jpeg;base64,{front_b64}"},
                     {"type": "input_image", "image_url": f"data:image/jpeg;base64,{back_b64}"},
                 ],
@@ -160,12 +179,20 @@ async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)
     except Exception:
         result = str(response)
 
-    return {"grading_result": result, "measurements": combined_pre}
+    return {"grading_result": result, "measurements": combined}
 
+@app.post("/preprocess")
+async def preprocess(front: UploadFile = File(...), back: UploadFile = File(...)):
+    """Diagnostic endpoint — returns ratios without grading."""
+    front_pre, front_img = preprocess_card_image(front)
+    back_pre, back_img = preprocess_card_image(back)
+    return {
+        "front": front_pre,
+        "back": back_pre,
+        "debug_front": f"data:image/jpeg;base64,{front_img}",
+        "debug_back": f"data:image/jpeg;base64,{back_img}",
+    }
 
-# ==========================================================
-# HEALTH CHECK
-# ==========================================================
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "MintCondition Card Grader API v1.8 running."}
+    return {"status": "ok", "message": "MintCondition Card Grader API v2.1 running."}
