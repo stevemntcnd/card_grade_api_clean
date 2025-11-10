@@ -45,17 +45,32 @@ def remove_shadows(gray):
     norm = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
     return norm
 
-def refine_edges(gray):
-    """Detect faint outer card border even with uneven lighting."""
-    gray = apply_clahe(gray)
-    gray = remove_shadows(gray)
+def refine_edges(gray, color_img=None):
+    """Detect faint outer card border even on off-white or shadowed scans."""
+    # --- 1. optional colour boost for yellowed borders ---
+    if color_img is not None:
+        b, g, r = cv2.split(color_img)
+        # boost red channel (helps on sepia/yellow cards)
+        gray = np.maximum(gray, r)
+
+    # --- 2. local contrast + shadow suppression ---
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    dilated = cv2.dilate(gray, np.ones((15, 15), np.uint8))
+    bg = cv2.medianBlur(dilated, 35)
+    diff = 255 - cv2.absdiff(gray, bg)
+    gray = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+
+    # --- 3. edge magnitude map (so faint borders survive) ---
     grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(grad_x, grad_y)
     norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, edges = cv2.threshold(norm, 12, 255, cv2.THRESH_BINARY)
-    edges = cv2.dilate(edges, np.ones((9,9), np.uint8), iterations=2)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+
+    # --- 4. threshold + morphological reinforcement ---
+    _, edges = cv2.threshold(norm, 5, 255, cv2.THRESH_BINARY)
+    edges = cv2.dilate(edges, np.ones((13, 13), np.uint8), iterations=3)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     return edges
 
 def get_main_contour(edges, image_shape):
@@ -94,7 +109,6 @@ def measure_borders(edge_img, axis="horizontal"):
 # PREPROCESSING
 # ==========================================================
 def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
-    """Extract border geometry and compute centering ratios."""
     buf = np.frombuffer(file.file.read(), np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
@@ -106,14 +120,19 @@ def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
         img = cv2.resize(img, (int(w / scale), int(h / scale)), interpolation=cv2.INTER_AREA)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = refine_edges(gray)
+    edges = refine_edges(gray, color_img=img)
     contour = get_main_contour(edges, img.shape)
 
     rect = cv2.minAreaRect(contour)
-    box = cv2.boxPoints(rect)
-    box = np.int0(box)
-    x_min, y_min = np.min(box[:,0]), np.min(box[:,1])
-    x_max, y_max = np.max(box[:,0]), np.max(box[:,1])
+    box = cv2.boxPoints(rect).astype(int)
+    x_min, y_min = np.min(box[:, 0]), np.min(box[:, 1])
+    x_max, y_max = np.max(box[:, 0]), np.max(box[:, 1])
+
+    # --- small outward pad so faint white frame isn’t cut off ---
+    pad = 4
+    x_min, y_min = max(0, x_min - pad), max(0, y_min - pad)
+    x_max, y_max = min(w, x_max + pad), min(h, y_max + pad)
+
     cropped = img[y_min:y_max, x_min:x_max]
     edges_cropped = edges[y_min:y_max, x_min:x_max]
 
