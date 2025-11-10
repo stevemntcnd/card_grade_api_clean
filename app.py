@@ -1,8 +1,8 @@
 """
-Mint Condition Card Grader API (v1.7)
+Mint Condition Card Grader API (v1.8)
 -------------------------------------
-Refined centering detection + structured prompt for OpenAI.
-Works with Render auto-deploy and FastAPI.
+Refined for extreme off-center detection (90/10+).
+Integrates updated Prompt Version 10.
 """
 
 from fastapi import FastAPI, UploadFile, File
@@ -15,10 +15,10 @@ from openai import OpenAI
 # ==========================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PROMPT_ID = "pmpt_690fe027d50c819782c0d8720142b0b00e6d4016c646f820"
-PROMPT_VERSION = "9"
+PROMPT_VERSION = "10"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Mint Condition Grader API (v1.7)")
+app = FastAPI(title="Mint Condition Grader API (v1.8 Extreme Centering Fix)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,19 +32,21 @@ app.add_middleware(
 # EDGE UTILITIES
 # ==========================================================
 def refine_edges(img_gray):
+    """Detect faint outer card border, even against similar backgrounds."""
     grad_x = cv2.Sobel(img_gray, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(img_gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(grad_x, grad_y)
     norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # Lower threshold for faint borders, then dilate to include full card edge
-    _, edges = cv2.threshold(norm, 25, 255, cv2.THRESH_BINARY)
-    edges = cv2.dilate(edges, np.ones((5,5), np.uint8), iterations=1)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+    # Lower threshold + heavier dilation to include faint dark borders
+    _, edges = cv2.threshold(norm, 15, 255, cv2.THRESH_BINARY)
+    edges = cv2.dilate(edges, np.ones((7,7), np.uint8), iterations=2)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
     return edges
 
 
 def measure_borders(edge_img, axis="horizontal"):
+    """Measure left/right or top/bottom border pixel thickness."""
     h, w = edge_img.shape
     if axis == "horizontal":
         left = next((x for x in range(w // 2) if np.count_nonzero(edge_img[:, x]) > 5), w)
@@ -60,6 +62,7 @@ def measure_borders(edge_img, axis="horizontal"):
 # PREPROCESSING
 # ==========================================================
 def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
+    """Extract border geometry and compute PSA-style centering ratios."""
     contents = np.frombuffer(file.file.read(), np.uint8)
     img = cv2.imdecode(contents, cv2.IMREAD_COLOR)
     if img is None:
@@ -98,6 +101,7 @@ def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
     horiz_ratio = round(min(left_px, right_px) / max(left_px, right_px + 1e-5), 3)
     vert_ratio = round(min(top_px, bottom_px) / max(top_px, bottom_px + 1e-5), 3)
 
+    # Identify extreme off-center (≈ 85/15 or worse)
     extreme_offcenter = horiz_ratio < 0.15 or vert_ratio < 0.15
     ceiling = 2.0 if extreme_offcenter else None
 
@@ -120,19 +124,21 @@ def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
 # ==========================================================
 @app.post("/grade-card")
 async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)):
+    """Main grading endpoint — preprocess + call OpenAI vision model."""
     front_pre, front_b64 = preprocess_card_image(front)
     back_pre, back_b64 = preprocess_card_image(back)
     combined_pre = {"front_measurements": front_pre, "back_measurements": back_pre}
 
     instruction_text = (
         "You are a PSA-style card grading assistant.\n"
-        "Use the provided preprocessing ratios for centering; do not re-measure from the image.\n"
-        "Treat ratios as ground truth (outer-border reference).\n"
-        "Evaluate corners, edges, and surface visually from attached images.\n"
-        "Output JSON matching schema v7.0."
+        "Use the provided preprocessing ratios for centering; do not re-measure visually.\n"
+        "Treat ratios below 0.15 as extreme off-center (≈90/10).\n"
+        "Ratios near 1.0 are balanced. Use them to determine centering score and ceiling.\n"
+        "Then evaluate corners, edges, and surface visually from attached images.\n"
+        "Output structured JSON matching schema v7.0."
     )
 
-    print(f"[INFO] Sending {front.filename} / {back.filename} with structured preprocessing.")
+    print(f"[INFO] Sending {front.filename} / {back.filename} with Prompt v10 and structured preprocessing.")
 
     response = client.responses.create(
         prompt={"id": PROMPT_ID, "version": PROMPT_VERSION},
@@ -162,4 +168,4 @@ async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)
 # ==========================================================
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "MintCondition Card Grader API v1.7 running."}
+    return {"status": "ok", "message": "MintCondition Card Grader API v1.8 running."}
