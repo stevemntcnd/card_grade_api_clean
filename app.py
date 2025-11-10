@@ -1,15 +1,15 @@
 """
-Mint Condition Card Grader API (v2.1)
+Mint Condition Card Grader API (v2.2)
 -------------------------------------
-• Includes enhanced preprocessing for accurate extreme off-centering (90/10+)
-• CLAHE lighting normalization
-• Shadow suppression and convex-hull contour recovery
-• Aspect-ratio sanity check
-• Full grading endpoint with Prompt v10 integration
+• Uses stable, verified preprocessing logic from old_working_python.py
+• Maintains full FastAPI structure for Render deployment
+• Environment-safe configuration (no hardcoded paths)
+• Returns clean JSON responses for Lovable / front-end integrations
 """
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import base64, cv2, numpy as np, json, os
 from openai import OpenAI
 
@@ -18,10 +18,10 @@ from openai import OpenAI
 # ==========================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PROMPT_ID = "pmpt_690fe027d50c819782c0d8720142b0b00e6d4016c646f820"
-PROMPT_VERSION = "10"
+PROMPT_VERSION = "9"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Mint Condition Grader API v2.1")
+app = FastAPI(title="Mint Condition Grader API v2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,186 +32,161 @@ app.add_middleware(
 )
 
 # ==========================================================
-# IMAGE UTILITIES
+# IMAGE PROCESSING LOGIC (from old_working_python.py)
 # ==========================================================
-def apply_clahe(gray):
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    return clahe.apply(gray)
-
-def remove_shadows(gray):
-    dilated = cv2.dilate(gray, np.ones((15,15), np.uint8))
-    bg = cv2.medianBlur(dilated, 35)
-    diff = 255 - cv2.absdiff(gray, bg)
-    norm = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
-    return norm
-
-def refine_edges(gray, color_img=None):
-    """Detect faint outer card border even on off-white or shadowed scans."""
-    # --- 1. optional colour boost for yellowed borders ---
-    if color_img is not None:
-        b, g, r = cv2.split(color_img)
-        # boost red channel (helps on sepia/yellow cards)
-        gray = np.maximum(gray, r)
-
-    # --- 2. local contrast + shadow suppression ---
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    dilated = cv2.dilate(gray, np.ones((15, 15), np.uint8))
-    bg = cv2.medianBlur(dilated, 35)
-    diff = 255 - cv2.absdiff(gray, bg)
-    gray = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
-
-    # --- 3. edge magnitude map (so faint borders survive) ---
-    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+def refine_edges_for_vintage(img_gray):
+    """Suppress false edges from soft gradients or fading ink typical in vintage cards."""
+    grad_x = cv2.Sobel(img_gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(img_gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(grad_x, grad_y)
     norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, strong_edges = cv2.threshold(norm, 40, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.morphologyEx(strong_edges, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # --- 4. threshold + morphological reinforcement ---
-    _, edges = cv2.threshold(norm, 5, 255, cv2.THRESH_BINARY)
-    edges = cv2.dilate(edges, np.ones((13, 13), np.uint8), iterations=3)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    return edges
-
-def get_main_contour(edges, image_shape):
-    """Find primary rectangular contour and repair gaps via convex hull."""
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ValueError("No contours found.")
-    h, w = image_shape[:2]
-    c = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(c)
-    (cx, cy), (rw, rh), _ = rect
-    aspect = rw / rh if rh else 1
-    if aspect < 0.6 or aspect > 1.6 or cv2.contourArea(c) < 0.2 * h * w:
-        for alt in sorted(contours, key=cv2.contourArea, reverse=True)[1:]:
-            r = cv2.minAreaRect(alt)
-            (cx, cy), (rw, rh), _ = r
-            a = rw / rh if rh else 1
-            if 0.6 < a < 1.6:
-                c = alt
-                break
-    return cv2.convexHull(c)
-
-def measure_borders(edge_img, axis="horizontal"):
-    """Return pixel thickness of borders on given axis."""
+def detect_border_distance(edge_img, axis='horizontal'):
     h, w = edge_img.shape
-    if axis == "horizontal":
-        left = next((x for x in range(w) if np.count_nonzero(edge_img[:, x]) > 5), w)
-        right = next((x for x in range(w - 1, -1, -1) if np.count_nonzero(edge_img[:, x]) > 5), w)
-        return max(left, 1), max(w - right, 1)
-    else:
-        top = next((y for y in range(h) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
-        bottom = next((y for y in range(h - 1, -1, -1) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
-        return max(top, 1), max(h - bottom, 1)
+    kernel = np.ones((3, 3), np.uint8)
+    edge_clean = cv2.morphologyEx(edge_img, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-# ==========================================================
-# PREPROCESSING
-# ==========================================================
+    if axis == 'horizontal':
+        left = next((x for x in range(w // 2) if np.count_nonzero(edge_clean[:, x]) > 5), w)
+        right = next((x for x in range(w - 1, w // 2, -1)
+                      if np.count_nonzero(edge_clean[:, x]) > 5), w)
+        return max(left, 2), max(w - right, 2)
+    else:
+        vert_kernel = np.ones((1, 5), np.uint8)
+        edge_vert = cv2.morphologyEx(edge_clean, cv2.MORPH_CLOSE, vert_kernel, iterations=2)
+
+        def scan_top():
+            for y in range(h // 2):
+                if np.count_nonzero(edge_vert[y, :]) > (0.25 * w):
+                    return y
+            return h
+
+        def scan_bottom():
+            for y in range(h - 1, h // 2, -1):
+                if np.count_nonzero(edge_vert[y, :]) > (0.25 * w):
+                    return y
+            return h
+
+        top_dist = scan_top()
+        bottom_edge = scan_bottom()
+        bottom_dist = h - bottom_edge
+        return max(top_dist, 2), max(bottom_dist, 2)
+
 def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
+    """Preprocess a single uploaded card image into JSON + base64 image."""
     buf = np.frombuffer(file.file.read(), np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f"Cannot load {file.filename}")
 
     h, w = img.shape[:2]
+    if h < w:
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        h, w = img.shape[:2]
+
     scale = max(h, w) / max_dim
     if scale > 1.0:
         img = cv2.resize(img, (int(w / scale), int(h / scale)), interpolation=cv2.INTER_AREA)
+        h, w = img.shape[:2]
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = refine_edges(gray, color_img=img)
-    contour = get_main_contour(edges, img.shape)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = refine_edges_for_vintage(blur)
 
-    rect = cv2.minAreaRect(contour)
-    box = cv2.boxPoints(rect).astype(int)
-    x_min, y_min = np.min(box[:, 0]), np.min(box[:, 1])
-    x_max, y_max = np.max(box[:, 0]), np.max(box[:, 1])
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No contours found.")
+    contour = max(contours, key=cv2.contourArea)
+    x, y, w_box, h_box = cv2.boundingRect(contour)
+    pad = int(0.02 * max(h_box, w_box))
+    x, y = max(x - pad, 0), max(y - pad, 0)
+    x2, y2 = min(x + w_box + pad, img.shape[1]), min(y + h_box + pad, img.shape[0])
+    cropped = img[y:y2, x:x2]
+    edges_cropped = edges[y:y2, x:x2]
 
-    # --- small outward pad so faint white frame isn’t cut off ---
-    pad = 4
-    x_min, y_min = max(0, x_min - pad), max(0, y_min - pad)
-    x_max, y_max = min(w, x_max + pad), min(h, y_max + pad)
+    left_px, right_px = detect_border_distance(edges_cropped, axis='horizontal')
+    top_px, bottom_px = detect_border_distance(edges_cropped, axis='vertical')
 
-    cropped = img[y_min:y_max, x_min:x_max]
-    edges_cropped = edges[y_min:y_max, x_min:x_max]
+    horizontal_ratio = round(min(left_px, right_px) / max(left_px, right_px + 1e-5), 3)
+    vertical_ratio = round(min(top_px, bottom_px) / max(top_px, bottom_px + 1e-5), 3)
 
-    left, right = measure_borders(edges_cropped, "horizontal")
-    top, bottom = measure_borders(edges_cropped, "vertical")
-
-    horiz_ratio = round(min(left, right) / max(left, right + 1e-5), 3)
-    vert_ratio = round(min(top, bottom) / max(top, bottom + 1e-5), 3)
-    extreme = horiz_ratio < 0.15 or vert_ratio < 0.15
-    ceiling = 2.0 if extreme else None
+    min_dimension = min(h, w)
+    relative_threshold = max(2, int(0.005 * min_dimension))  # 0.5%
+    extreme_offcenter = (
+        (left_px < relative_threshold or right_px < relative_threshold or
+         top_px < relative_threshold or bottom_px < relative_threshold) and
+        (horizontal_ratio < 0.10 or vertical_ratio < 0.10)
+    )
+    ceiling = 2.0 if extreme_offcenter else None
 
     pre_json = {
         "filename": file.filename,
-        "dimensions": {"width": w, "height": h},
-        "borders": {"top": top, "bottom": bottom, "left": left, "right": right},
-        "ratios": {"horizontal": horiz_ratio, "vertical": vert_ratio},
-        "extreme_offcenter": extreme,
-        "ceiling": ceiling,
+        "height_px": h,
+        "width_px": w,
+        "top_px": int(top_px),
+        "bottom_px": int(bottom_px),
+        "left_px": int(left_px),
+        "right_px": int(right_px),
+        "horizontal_ratio": horizontal_ratio,
+        "vertical_ratio": vertical_ratio,
+        "aspect_ratio": round(w / h, 3),
+        "extreme_offcenter": extreme_offcenter,
+        "ceiling": ceiling
     }
 
-    _, enc = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    b64 = base64.b64encode(enc).decode("utf-8")
-    return pre_json, b64
+    _, buffer = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    b64_img = base64.b64encode(buffer).decode("utf-8")
 
-# ==========================================================
-# ENDPOINTS
-# ==========================================================
-@app.post("/grade-card")
-async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)):
-    """Preprocess both sides and send for grading."""
-    front_pre, front_b64 = preprocess_card_image(front)
-    back_pre, back_b64 = preprocess_card_image(back)
-    combined = {"front_measurements": front_pre, "back_measurements": back_pre}
+    return pre_json, b64_img
 
-    instruction = (
-        "You are a PSA-style card grading assistant.\n"
-        "Use the provided preprocessing ratios for centering; do not re-measure visually.\n"
-        "Treat ratios below 0.15 as extreme off-center (~90/10).\n"
-        "Ratios near 1.0 are balanced. Use them to determine centering score and ceiling.\n"
-        "Then evaluate corners, edges, and surface visually from the attached images.\n"
-        "Output structured JSON matching schema v10.0."
-    )
-
-    print(f"[INFO] Grading {front.filename} / {back.filename} using Prompt v10")
-
+def grade_card(front_b64, back_b64, pre_json):
+    """Send preprocessed data to OpenAI grading model."""
     response = client.responses.create(
         prompt={"id": PROMPT_ID, "version": PROMPT_VERSION},
         input=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": instruction},
-                    {"type": "input_text", "text": json.dumps(combined, indent=2)},
+                    {"type": "input_text", "text": json.dumps(pre_json)},
                     {"type": "input_image", "image_url": f"data:image/jpeg;base64,{front_b64}"},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{back_b64}"},
-                ],
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{back_b64}"}
+                ]
             }
-        ],
+        ]
     )
-
     try:
-        result = response.output_text
+        return response.output_text
     except Exception:
-        result = str(response)
+        return str(response)
 
-    return {"grading_result": result, "measurements": combined}
+# ==========================================================
+# FASTAPI ENDPOINTS
+# ==========================================================
+@app.post("/grade-card")
+async def grade_card_endpoint(front: UploadFile = File(...), back: UploadFile = File(...)):
+    """Preprocess both sides and send for grading."""
+    front_pre, front_b64 = preprocess_card_image(front)
+    back_pre, back_b64 = preprocess_card_image(back)
+    combined = {"front_measurements": front_pre, "back_measurements": back_pre}
+
+    result = grade_card(front_b64, back_b64, combined)
+    return JSONResponse(content={"grading_result": result, "measurements": combined})
 
 @app.post("/preprocess")
-async def preprocess(front: UploadFile = File(...), back: UploadFile = File(...)):
-    """Diagnostic endpoint — returns ratios without grading."""
+async def preprocess_endpoint(front: UploadFile = File(...), back: UploadFile = File(...)):
+    """Diagnostic endpoint — returns preprocessing JSON without grading."""
     front_pre, front_img = preprocess_card_image(front)
     back_pre, back_img = preprocess_card_image(back)
-    return {
+    return JSONResponse(content={
         "front": front_pre,
         "back": back_pre,
         "debug_front": f"data:image/jpeg;base64,{front_img}",
         "debug_back": f"data:image/jpeg;base64,{back_img}",
-    }
+    })
 
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "MintCondition Card Grader API v2.1 running."}
+    return {"status": "ok", "message": "MintCondition Card Grader API v2.2 running with working logic."}
