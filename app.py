@@ -1,8 +1,8 @@
 """
-app.py — Mint Condition Grading API (Improved Prompt Integration)
----------------------------------------------------------------
-Upgrades your production Render build to send structured preprocessing
-results and clear instructions to OpenAI for improved centering accuracy.
+Mint Condition Card Grader API (v1.7)
+-------------------------------------
+Refined centering detection + structured prompt for OpenAI.
+Works with Render auto-deploy and FastAPI.
 """
 
 from fastapi import FastAPI, UploadFile, File
@@ -11,14 +11,14 @@ import base64, cv2, numpy as np, json, os
 from openai import OpenAI
 
 # ==========================================================
-# CONFIGURATION
+# CONFIG
 # ==========================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-yourkeyhere")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PROMPT_ID = "pmpt_690fe027d50c819782c0d8720142b0b00e6d4016c646f820"
 PROMPT_VERSION = "9"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Mint Condition Grading API (v1.6 Refined)")
+app = FastAPI(title="Mint Condition Grader API (v1.7)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,16 +29,20 @@ app.add_middleware(
 )
 
 # ==========================================================
-# EDGE / BORDER UTILITIES
+# EDGE UTILITIES
 # ==========================================================
 def refine_edges(img_gray):
     grad_x = cv2.Sobel(img_gray, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(img_gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(grad_x, grad_y)
     norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, edges = cv2.threshold(norm, 40, 255, cv2.THRESH_BINARY)
-    kernel = np.ones((3, 3), np.uint8)
-    return cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+    # Lower threshold for faint borders, then dilate to include full card edge
+    _, edges = cv2.threshold(norm, 25, 255, cv2.THRESH_BINARY)
+    edges = cv2.dilate(edges, np.ones((5,5), np.uint8), iterations=1)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+    return edges
+
 
 def measure_borders(edge_img, axis="horizontal"):
     h, w = edge_img.shape
@@ -50,6 +54,7 @@ def measure_borders(edge_img, axis="horizontal"):
         top = next((y for y in range(h // 2) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
         bottom = next((y for y in range(h - 1, h // 2, -1) if np.count_nonzero(edge_img[y, :]) > 0.25 * w), h)
         return max(top, 2), max(h - bottom, 2)
+
 
 # ==========================================================
 # PREPROCESSING
@@ -74,7 +79,16 @@ def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
         raise ValueError("No contours found.")
 
     c = max(contours, key=cv2.contourArea)
-    x, y, w_box, h_box = cv2.boundingRect(c)
+    rect = cv2.minAreaRect(c)
+    box = cv2.boxPoints(rect)
+    box = np.int0(box)
+    x_coords = [p[0] for p in box]
+    y_coords = [p[1] for p in box]
+    x_min, x_max = min(x_coords), max(x_coords)
+    y_min, y_max = min(y_coords), max(y_coords)
+    w_box, h_box = x_max - x_min, y_max - y_min
+    x, y = x_min, y_min
+
     cropped = img[y:y+h_box, x:x+w_box]
     edges_cropped = edges[y:y+h_box, x:x+w_box]
 
@@ -84,41 +98,41 @@ def preprocess_card_image(file: UploadFile, quality=90, max_dim=1500):
     horiz_ratio = round(min(left_px, right_px) / max(left_px, right_px + 1e-5), 3)
     vert_ratio = round(min(top_px, bottom_px) / max(top_px, bottom_px + 1e-5), 3)
 
-    extreme_offcenter = horiz_ratio < 0.1 or vert_ratio < 0.1
+    extreme_offcenter = horiz_ratio < 0.15 or vert_ratio < 0.15
+    ceiling = 2.0 if extreme_offcenter else None
 
     pre_json = {
         "filename": file.filename,
         "dimensions": {"width": w, "height": h},
         "borders": {"top": top_px, "bottom": bottom_px, "left": left_px, "right": right_px},
         "ratios": {"horizontal": horiz_ratio, "vertical": vert_ratio},
-        "extreme_offcenter": extreme_offcenter
+        "extreme_offcenter": extreme_offcenter,
+        "ceiling": ceiling,
     }
 
     _, buffer = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     b64_img = base64.b64encode(buffer).decode("utf-8")
-
     return pre_json, b64_img
 
+
 # ==========================================================
-# ROUTE: GRADE CARD
+# GRADE ENDPOINT
 # ==========================================================
 @app.post("/grade-card")
 async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)):
     front_pre, front_b64 = preprocess_card_image(front)
     back_pre, back_b64 = preprocess_card_image(back)
-
     combined_pre = {"front_measurements": front_pre, "back_measurements": back_pre}
 
-    # Build clear model instructions
     instruction_text = (
         "You are a PSA-style card grading assistant.\n"
-        "Use the provided preprocessing measurements for centering and borders.\n"
-        "Do not re-measure centering visually — trust the ratios below.\n"
-        "Then evaluate corners, edges, and surface condition from the attached images.\n"
-        "Output a structured JSON matching the grading schema (v7.0)."
+        "Use the provided preprocessing ratios for centering; do not re-measure from the image.\n"
+        "Treat ratios as ground truth (outer-border reference).\n"
+        "Evaluate corners, edges, and surface visually from attached images.\n"
+        "Output JSON matching schema v7.0."
     )
 
-    print(f"[INFO] Sending {front.filename} / {back.filename} to OpenAI with structured preprocessing.")
+    print(f"[INFO] Sending {front.filename} / {back.filename} with structured preprocessing.")
 
     response = client.responses.create(
         prompt={"id": PROMPT_ID, "version": PROMPT_VERSION},
@@ -129,10 +143,10 @@ async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)
                     {"type": "input_text", "text": instruction_text},
                     {"type": "input_text", "text": json.dumps(combined_pre, indent=2)},
                     {"type": "input_image", "image_url": f"data:image/jpeg;base64,{front_b64}"},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{back_b64}"}
-                ]
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{back_b64}"},
+                ],
             }
-        ]
+        ],
     )
 
     try:
@@ -142,9 +156,10 @@ async def grade_card(front: UploadFile = File(...), back: UploadFile = File(...)
 
     return {"grading_result": result, "measurements": combined_pre}
 
+
 # ==========================================================
 # HEALTH CHECK
 # ==========================================================
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "MintCondition Card Grader API is live."}
+    return {"status": "ok", "message": "MintCondition Card Grader API v1.7 running."}
